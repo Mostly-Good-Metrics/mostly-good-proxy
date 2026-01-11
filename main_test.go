@@ -4,16 +4,17 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
 
 func TestGetClientIP(t *testing.T) {
 	tests := []struct {
-		name     string
-		headers  map[string]string
+		name       string
+		headers    map[string]string
 		remoteAddr string
-		expected string
+		expected   string
 	}{
 		{
 			name:     "CF-Connecting-IP takes priority",
@@ -118,32 +119,11 @@ func TestProxyForwardsClientIP(t *testing.T) {
 
 	// Create proxy handler pointing to our mock upstream
 	client := &http.Client{}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientIP := getClientIP(r)
-
-		targetReq, _ := http.NewRequest(r.Method, upstream.URL+r.URL.RequestURI(), r.Body)
-		for key, values := range r.Header {
-			for _, value := range values {
-				targetReq.Header.Add(key, value)
-			}
-		}
-		targetReq.Header.Set("X-MGM-Client-IP", clientIP)
-
-		resp, err := client.Do(targetReq)
-		if err != nil {
-			http.Error(w, "Failed to reach upstream", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-	})
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("failed to parse upstream URL: %v", err)
+	}
+	handler := proxyHandler(target, client)
 
 	// Test that the proxy correctly extracts and forwards the client IP
 	tests := []struct {
@@ -195,32 +175,11 @@ func TestProxyForwardsHeaders(t *testing.T) {
 	defer upstream.Close()
 
 	client := &http.Client{}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientIP := getClientIP(r)
-
-		targetReq, _ := http.NewRequest(r.Method, upstream.URL+r.URL.RequestURI(), r.Body)
-		for key, values := range r.Header {
-			for _, value := range values {
-				targetReq.Header.Add(key, value)
-			}
-		}
-		targetReq.Header.Set("X-MGM-Client-IP", clientIP)
-
-		resp, err := client.Do(targetReq)
-		if err != nil {
-			http.Error(w, "Failed to reach upstream", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
-	})
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("failed to parse upstream URL: %v", err)
+	}
+	handler := proxyHandler(target, client)
 
 	req := httptest.NewRequest("POST", "/v1/events", strings.NewReader(`{"events":[]}`))
 	req.Header.Set("X-MGM-Key", "test-api-key-123")
@@ -255,26 +214,11 @@ func TestProxyForwardsBody(t *testing.T) {
 	defer upstream.Close()
 
 	client := &http.Client{}
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		clientIP := getClientIP(r)
-
-		targetReq, _ := http.NewRequest(r.Method, upstream.URL+r.URL.RequestURI(), r.Body)
-		for key, values := range r.Header {
-			for _, value := range values {
-				targetReq.Header.Add(key, value)
-			}
-		}
-		targetReq.Header.Set("X-MGM-Client-IP", clientIP)
-
-		resp, err := client.Do(targetReq)
-		if err != nil {
-			http.Error(w, "Failed to reach upstream", http.StatusBadGateway)
-			return
-		}
-		defer resp.Body.Close()
-
-		w.WriteHeader(resp.StatusCode)
-	})
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("failed to parse upstream URL: %v", err)
+	}
+	handler := proxyHandler(target, client)
 
 	req := httptest.NewRequest("POST", "/v1/events", strings.NewReader(expectedBody))
 	w := httptest.NewRecorder()
@@ -283,5 +227,45 @@ func TestProxyForwardsBody(t *testing.T) {
 
 	if w.Code != http.StatusNoContent {
 		t.Errorf("proxy returned %d, want %d", w.Code, http.StatusNoContent)
+	}
+}
+
+func TestProxyStripsHopByHopHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Connection"); got != "" {
+			t.Errorf("upstream received Connection header = %q, want empty", got)
+		}
+		if got := r.Header.Get("Upgrade"); got != "" {
+			t.Errorf("upstream received Upgrade header = %q, want empty", got)
+		}
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Upgrade", "websocket")
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	client := &http.Client{}
+	target, err := url.Parse(upstream.URL)
+	if err != nil {
+		t.Fatalf("failed to parse upstream URL: %v", err)
+	}
+	handler := proxyHandler(target, client)
+
+	req := httptest.NewRequest("GET", "/v1/events", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("proxy returned %d, want %d", w.Code, http.StatusNoContent)
+	}
+
+	if got := w.Header().Get("Connection"); got != "" {
+		t.Errorf("client received Connection header = %q, want empty", got)
+	}
+	if got := w.Header().Get("Upgrade"); got != "" {
+		t.Errorf("client received Upgrade header = %q, want empty", got)
 	}
 }

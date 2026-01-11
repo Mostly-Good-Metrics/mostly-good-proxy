@@ -30,7 +30,16 @@ func main() {
 		Timeout: 30 * time.Second,
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/", proxyHandler(target, client))
+
+	log.Printf("MGM Proxy starting on :%s -> %s", port, targetURL)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func proxyHandler(target *url.URL, client *http.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		// Health check
 		if r.URL.Path == "/health" {
 			w.WriteHeader(http.StatusOK)
@@ -47,13 +56,10 @@ func main() {
 			http.Error(w, "Failed to create request", http.StatusInternalServerError)
 			return
 		}
+		targetReq.Host = target.Host
 
-		// Copy headers from original request
-		for key, values := range r.Header {
-			for _, value := range values {
-				targetReq.Header.Add(key, value)
-			}
-		}
+		// Copy headers from original request, stripping hop-by-hop headers.
+		copyHeaders(targetReq.Header, r.Header)
 
 		// Set the client IP header that MGM expects
 		targetReq.Header.Set("X-MGM-Client-IP", clientIP)
@@ -68,20 +74,11 @@ func main() {
 		defer resp.Body.Close()
 
 		// Copy response headers
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
+		copyHeaders(w.Header(), resp.Header)
 
 		// Copy status code and body
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
-	})
-
-	log.Printf("MGM Proxy starting on :%s -> %s", port, targetURL)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatal(err)
 	}
 }
 
@@ -89,10 +86,10 @@ func main() {
 func getClientIP(r *http.Request) string {
 	// Check common headers in order of preference
 	headers := []string{
-		"CF-Connecting-IP",     // Cloudflare
-		"True-Client-IP",       // Akamai, Cloudflare Enterprise
-		"X-Real-IP",            // Nginx
-		"X-Forwarded-For",      // Standard proxy header
+		"CF-Connecting-IP", // Cloudflare
+		"True-Client-IP",   // Akamai, Cloudflare Enterprise
+		"X-Real-IP",        // Nginx
+		"X-Forwarded-For",  // Standard proxy header
 	}
 
 	for _, header := range headers {
@@ -121,4 +118,47 @@ func getClientIP(r *http.Request) string {
 		}
 	}
 	return ip
+}
+
+var hopByHopHeaders = map[string]struct{}{
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Proxy-Connection":    {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+}
+
+func copyHeaders(dst, src http.Header) {
+	connectionTokens := connectionHeaderTokens(src)
+
+	for key, values := range src {
+		canonicalKey := http.CanonicalHeaderKey(key)
+		if _, ok := hopByHopHeaders[canonicalKey]; ok {
+			continue
+		}
+		if _, ok := connectionTokens[canonicalKey]; ok {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func connectionHeaderTokens(headers http.Header) map[string]struct{} {
+	tokens := make(map[string]struct{})
+	if value := headers.Get("Connection"); value != "" {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+			tokens[http.CanonicalHeaderKey(token)] = struct{}{}
+		}
+	}
+	return tokens
 }
